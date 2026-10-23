@@ -4,15 +4,26 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import select
 import socket
+import ssl
+import struct
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from socketserver import ThreadingMixIn
 
-from cn_suffixes import CN_SUFFIXES, DIRECT_SUFFIXES
+from cn_suffixes import (
+    CN_SUFFIXES,
+    DIRECT_SUFFIXES,
+    is_bilibili_related,
+    is_campus_cn,
+    is_public_ip_literal,
+    is_yungu_related,
+)
 from crypto3 import derive_keys
 from direct_or_hop import StickyCampus
 from tunnel_proto import TYPE_CLOSE, TYPE_DATA, TYPE_ERR, TYPE_OK, TYPE_OPEN
@@ -21,24 +32,16 @@ from tunnel_proto import client_handshake, recv_frame, send_frame
 KEYS = None
 INNER_HOST = "127.0.0.1"
 INNER_PORT = 17900
-EXIT_HOST = "110.40.153.38"
+EXIT_HOST = "117.55.227.80"
 CAMPUS_TRY = 1.0
 STICKY = StickyCampus(fail_hold=45.0)
-# VPS 到不了这些站；校园网抖也不改走服务器。
-NEVER_HOP_SUFFIXES = (
-    "google.com",
-    "google.com.hk",
-    "googleapis.com",
-    "gstatic.com",
-    "googleusercontent.com",
-    "googlevideo.com",
-    "youtube.com",
-    "ytimg.com",
-    "ggpht.com",
-    "gvt1.com",
-    "github.com",
-    "githubusercontent.com",
-)
+# 图片站校园网 TLS 很快，主站经常 TCP 秒连、握手挂死。不能用一次成功代表整站。
+BILI_TLS_TIMEOUT = 1.2
+BILI_TLS_OK_HOLD = 30.0
+_BILI_LOCK = threading.Lock()
+_BILI_OK_IP: dict[str, tuple[str, float]] = {}
+# 出口是洛杉矶。这些站校园网经常超时，直接走服务器。
+NEVER_HOP_SUFFIXES = ()
 
 
 def never_hop(host: str) -> bool:
@@ -58,21 +61,45 @@ VPS_SUFFIXES = (
     "steamusercontent.com",
     "steam-chat.com",
     "steamcontent.com",
+    "steamserver.net",
+    "steamstat.us",
+    "cloudcone.com",
+    "google.com",
+    "google.com.hk",
+    "googleapis.com",
+    "gstatic.com",
+    "googleusercontent.com",
+    "googlevideo.com",
+    "youtube.com",
+    "ytimg.com",
+    "ggpht.com",
+    "gvt1.com",
+    "github.com",
+    "githubusercontent.com",
+    "chatgpt.com",
+    "openai.com",
+    "oaistatic.com",
+    "oaiusercontent.com",
+    "amap.com",
+    "gaode.com",
+    "autonavi.com",
 )
 
 
-def is_task_yungu(host: str) -> bool:
-    host = (host or "").lower().split("%")[0].rstrip(".")
-    return host == "task.yungu.org" or host.endswith(".task.yungu.org") or host == "116.62.109.80"
-
-
 def always_hop(host: str) -> bool:
-    """国内站和 Cursor 固定走 VPS。"""
+    """国内站和 Cursor 固定走 VPS。哔哩哔哩先试校园网（通就快），不通再 hop。"""
     host = (host or "").lower()
     if never_hop(host):
         return False
+    if is_yungu_related(host) or is_campus_cn(host):
+        return False
     if any(host == s or host.endswith("." + s) for s in DIRECT_SUFFIXES):
         return False
+    # 校园网间歇性可看 B 站；强制洛杉矶会把 API/静态资源拖到数秒级。
+    if is_bilibili_related(host):
+        return False
+    if is_public_ip_literal(host):
+        return True
     if any(host == s or host.endswith("." + s) for s in VPS_SUFFIXES):
         return True
     return any(host == s or host.endswith("." + s) for s in CN_SUFFIXES)
@@ -90,18 +117,182 @@ def open_inner():
     return sock
 
 
+def dns_lookup_a(name: str, server: str = "223.5.5.5") -> list[str]:
+    """A records from a specific resolver. Used so Bilibili is not 8.8.8.8 overseas IPs."""
+    labels = name.strip(".").split(".")
+    if not labels or any(not part for part in labels):
+        return []
+    qname = b"".join(bytes([len(part)]) + part.encode("ascii") for part in labels) + b"\x00"
+    req = struct.pack("!HHHHHH", 0x3344, 0x0100, 1, 0, 0, 0) + qname + struct.pack("!HH", 1, 1)
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.settimeout(1.2)
+        sock.sendto(req, (server, 53))
+        data, _ = sock.recvfrom(2048)
+    if len(data) < 12:
+        return []
+    answers = struct.unpack("!H", data[6:8])[0]
+    i = 12
+    while i < len(data):
+        if data[i] >= 0xC0:
+            i += 2
+            break
+        if data[i] == 0:
+            i += 1
+            break
+        i += 1 + data[i]
+    i += 4
+    ips: list[str] = []
+    for _ in range(answers):
+        if i >= len(data):
+            break
+        if data[i] >= 0xC0:
+            i += 2
+        else:
+            while i < len(data) and data[i] != 0:
+                if data[i] >= 0xC0:
+                    i += 2
+                    break
+                i += 1 + data[i]
+            else:
+                i += 1
+        if i + 10 > len(data):
+            break
+        rtype, _rclass, _ttl, rdlen = struct.unpack("!HHIH", data[i : i + 10])
+        i += 10
+        if rtype == 1 and rdlen == 4 and i + 4 <= len(data):
+            ip = socket.inet_ntoa(data[i : i + 4])
+            try:
+                addr = ipaddress.ip_address(ip)
+            except ValueError:
+                addr = None
+            if addr and not (addr.is_loopback or addr.is_unspecified or addr.is_link_local):
+                ips.append(ip)
+        i += rdlen
+    return ips
+
+
+def ipv4_hop_target(host: str, port: int) -> str | None:
+    """Hop by IPv4 only. A poisoned AAAA (face:b00c) makes Chrome report a failed tunnel."""
+    bare = host.strip("[]")
+    try:
+        addr = ipaddress.ip_address(bare)
+    except ValueError:
+        addr = None
+    if addr is not None:
+        if addr.version == 6 or addr.is_loopback or addr.is_unspecified or addr.is_link_local:
+            return None
+        return bare
+    # 洛杉矶出口自己解析。先在校园网解析会得到国内地址，那边连不上。
+    if bare == "app.cloudcone.com":
+        return "148.135.114.68"
+    return bare
+
+
+def connect_campus(host: str, port: int, timeout: float):
+    """Campus TCP. Bilibili family uses AliDNS so 8.8.8.8 overseas A records are skipped."""
+    ips: list[str] = []
+    if is_campus_cn(host) or is_bilibili_related(host):
+        for server in ("223.5.5.5", "114.114.114.114"):
+            try:
+                ips = dns_lookup_a(host, server)
+            except OSError:
+                ips = []
+            if ips:
+                break
+    last: OSError | None = None
+    for target in ips[:6] or [host]:
+        try:
+            sock = socket.create_connection((target, port), timeout)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            return sock
+        except OSError as exc:
+            last = exc
+    raise last or OSError("campus connect failed")
+
+
+def stay_on_campus(host: str) -> bool:
+    return never_hop(host) or is_yungu_related(host) or is_campus_cn(host)
+
+
+def _bili_candidates(host: str) -> list[str]:
+    ips: list[str] = []
+    for server in ("223.5.5.5", "114.114.114.114"):
+        try:
+            ips = dns_lookup_a(host, server)
+        except OSError:
+            ips = []
+        if ips:
+            break
+    return ips[:3] or [host]
+
+
+def bili_campus_ip(host: str, port: int) -> str | None:
+    """IP whose TLS handshake finishes. None means this host should hop."""
+    gate = host.lower()
+    if port != 443:
+        gate = "www.bilibili.com"
+    now = time.time()
+    cached = _BILI_OK_IP.get(gate)
+    if cached and now < cached[1] and not STICKY.skip_campus(gate):
+        return cached[0]
+    if STICKY.skip_campus(gate):
+        return None
+    with _BILI_LOCK:
+        now = time.time()
+        cached = _BILI_OK_IP.get(gate)
+        if cached and now < cached[1] and not STICKY.skip_campus(gate):
+            return cached[0]
+        if STICKY.skip_campus(gate):
+            return None
+        ctx = ssl.create_default_context()
+        for ip in _bili_candidates(gate):
+            sock = None
+            try:
+                sock = socket.create_connection((ip, 443), BILI_TLS_TIMEOUT)
+                sock.settimeout(BILI_TLS_TIMEOUT)
+                tls = ctx.wrap_socket(sock, server_hostname=gate)
+                tls.close()
+                _BILI_OK_IP[gate] = (ip, time.time() + BILI_TLS_OK_HOLD)
+                STICKY.mark_ok(gate)
+                return ip
+            except OSError:
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+        STICKY.mark_fail(gate)
+        _BILI_OK_IP.pop(gate, None)
+        return None
+
+
 def try_campus(host: str, port: int):
     if host in ("127.0.0.1", "::1", "localhost", EXIT_HOST):
         return None
-    if STICKY.skip_campus(host):
+    bili_ip = None
+    if is_bilibili_related(host):
+        if port == 443:
+            bili_ip = bili_campus_ip(host, port)
+            if bili_ip is None:
+                return None
+        elif bili_campus_ip("www.bilibili.com", 443) is None:
+            return None
+    campus_cn = is_campus_cn(host)
+    if not campus_cn and not is_bilibili_related(host) and STICKY.skip_campus(host):
         return None
     try:
-        sock = socket.create_connection((host, port), CAMPUS_TRY)
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        if bili_ip:
+            sock = socket.create_connection((bili_ip, port), CAMPUS_TRY)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            return sock
+        sock = connect_campus(host, port, CAMPUS_TRY)
         STICKY.mark_ok(host)
         return sock
     except OSError:
-        STICKY.mark_fail(host)
+        if not campus_cn and not is_bilibili_related(host):
+            STICKY.mark_fail(host)
+        if is_bilibili_related(host):
+            STICKY.mark_fail(host.lower() if port == 443 else "www.bilibili.com")
         return None
 
 
@@ -115,7 +306,7 @@ def splice(a, b):
             for src in readable:
                 dest = b if src is a else a
                 try:
-                    data = src.recv(16384)
+                    data = src.recv(65536)
                 except OSError:
                     return
                 if not data:
@@ -136,7 +327,7 @@ def pump(browser, inner, keys):
             if not readable:
                 break
             if browser in readable:
-                data = browser.recv(16384)
+                data = browser.recv(65536)
                 if not data:
                     try:
                         send_frame(inner, keys, TYPE_CLOSE)
@@ -178,18 +369,13 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             self.send_error(400)
             return
-        if is_task_yungu(host):
-            self.send_error(403, "task.yungu.org is direct only")
-            self.log_via("refuse-task", 403)
-            return
         dest = None if always_hop(host) else try_campus(host, port)
-        if dest is None and never_hop(host):
+        if dest is None and stay_on_campus(host):
             try:
-                dest = socket.create_connection((host, port), 4.0)
-                dest.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                dest = connect_campus(host, port, 4.0)
                 STICKY.mark_ok(host)
             except OSError:
-                self.send_error(504, "campus google/github unreachable")
+                self.send_error(504, "campus google/github/yungu/bilibili unreachable")
                 return
         if dest:
             try:
@@ -201,7 +387,12 @@ class Handler(BaseHTTPRequestHandler):
             finally:
                 dest.close()
             return
-        hostport = self.path.encode("ascii", "replace")
+        target = ipv4_hop_target(host, port)
+        if target is None:
+            self.send_error(502, "ipv6 skipped")
+            self.log_via("skip-ipv6", 502)
+            return
+        hostport = ("%s:%s" % (target, port)).encode("ascii", "replace")
         try:
             inner = open_inner()
         except OSError as exc:
@@ -236,11 +427,13 @@ class Handler(BaseHTTPRequestHandler):
         if ":" not in hostport:
             hostport = hostport + ":80"
         host, port_s = hostport.rsplit(":", 1)
-        if is_task_yungu(host):
-            self.send_error(403, "task.yungu.org is direct only")
-            self.log_via("refuse-task", 403)
-            return
         dest = None if always_hop(host) else try_campus(host, int(port_s))
+        if dest is None and stay_on_campus(host):
+            try:
+                dest = connect_campus(host, int(port_s), 4.0)
+                STICKY.mark_ok(host)
+            except OSError:
+                dest = None
         if dest:
             try:
                 req = "%s %s %s\r\n" % (self.command, path, self.protocol_version)
@@ -262,6 +455,9 @@ class Handler(BaseHTTPRequestHandler):
                 splice(self.connection, dest)
             finally:
                 dest.close()
+            return
+        if is_yungu_related(host) or is_campus_cn(host):
+            self.send_error(504, "campus yungu/bilibili unreachable")
             return
         try:
             inner = open_inner()

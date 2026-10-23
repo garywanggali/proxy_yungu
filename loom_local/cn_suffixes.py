@@ -1,6 +1,8 @@
 # Host suffixes treated as mainland China. Matched as exact host or domain suffix.
 # School / LAN hosts are NOT listed here; those stay DIRECT (campus).
 
+import ipaddress
+
 CN_SUFFIXES = (
     "cn",
     "中国",
@@ -139,3 +141,64 @@ DIRECT_SUFFIXES = (
     "yunguhs.com",
     "localhost",
 )
+TASK_YUNGU_IPS = ("116.62.109.80",)
+
+
+def is_yungu_related(host: str) -> bool:
+    """School task site and its OSS/telemetry: campus exit only, never VPS."""
+    host = (host or "").lower().split("%")[0].rstrip(".")
+    if not host:
+        return False
+    if host in TASK_YUNGU_IPS:
+        return True
+    return "yungu" in host
+
+
+# 网易云、百度、Prometric、图寻固定走校园网。其它国内站仍可走洛杉矶。
+CAMPUS_CN_SUFFIXES = (
+    "tuxun.fun",
+    "daai.fun",
+    "chao-fan.com",
+    "dbankcdn.cn",
+    "prometric.com.cn",
+    "music.163.com",
+    "iplay.163.com",
+    "look.163.com",
+    "music.126.net",
+    "vod.126.net",
+    "baidu.com",
+    "baidu.jp",
+    "bdstatic.com",
+    "bdimg.com",
+    "baidustatic.com",
+    "baidubce.com",
+    "baidupcs.com",
+    "hao123.com",
+)
+
+_BILI_MARKS = ("bili", "hdslb", "szbdyd", "b23.tv", "acgvideo", "acg.tv", "upos-")
+
+
+def is_bilibili_related(host: str) -> bool:
+    host = (host or "").lower().split("%")[0].rstrip(".")
+    return any(mark in host for mark in _BILI_MARKS)
+
+
+def is_public_ip_literal(host: str) -> bool:
+    try:
+        addr = ipaddress.ip_address((host or "").strip("[]"))
+    except ValueError:
+        return False
+    return not (
+        addr.is_private
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_multicast
+        or addr.is_unspecified
+        or addr.is_reserved
+    )
+
+
+def is_campus_cn(host: str) -> bool:
+    host = (host or "").lower().split("%")[0].rstrip(".")
+    return any(host == s or host.endswith("." + s) for s in CAMPUS_CN_SUFFIXES)
