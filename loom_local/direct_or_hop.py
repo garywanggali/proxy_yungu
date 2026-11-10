@@ -140,9 +140,10 @@ function FindProxyForURL(url, host) {{
     if (!host) return "DIRECT";
     host = host.toLowerCase();
     if (host === "task.yungu.org" || dnsDomainIs(host, ".task.yungu.org") || host === "116.62.109.80") return "DIRECT";
+    if (host.indexOf("yungu") !== -1) return "DIRECT";
     if (isPlainHostName(host)) return "DIRECT";
     if (host === "127.0.0.1" || host === "::1" || host === "localhost") return "DIRECT";
-    if (host === "110.40.153.38") return "DIRECT";
+    if (host === "117.55.227.80") return "DIRECT";
     if (host === "{proxy_host}") return "DIRECT";
     try {{
         if (isInNet(host, "10.0.0.0", "255.0.0.0")) return "DIRECT";
@@ -177,9 +178,10 @@ function FindProxyForURL(url, host) {{
     if (!host) return "DIRECT";
     host = host.toLowerCase();
     if (host === "task.yungu.org" || dnsDomainIs(host, ".task.yungu.org") || host === "116.62.109.80") return "DIRECT";
+    if (host.indexOf("yungu") !== -1) return "DIRECT";
     if (isPlainHostName(host)) return "DIRECT";
     if (host === "127.0.0.1" || host === "::1" || host === "localhost") return "DIRECT";
-    if (host === "110.40.153.38") return "DIRECT";
+    if (host === "117.55.227.80") return "DIRECT";
     if (host === "{proxy_host}") return "DIRECT";
     try {{
         if (isInNet(host, "10.0.0.0", "255.0.0.0")) return "DIRECT";

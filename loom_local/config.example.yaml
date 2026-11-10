@@ -1,11 +1,12 @@
 # 只给这台电脑用。复制为 config.yaml。不要提交 config.yaml。
 # 不占用 Fisher 的 8080。
 
-# 本机 PAC：国内站点走服务器，国外走校园网直连。start.sh 会挂着 loop。
-# ssh = 国内走 110.40.153.38。隧道内三层加密 + WebSocket 伪装，不是明文 CONNECT。
+# 本机 PAC：校外流量走洛杉矶服务器。start.sh 会挂着 loop。
+# ssh = 117.55.227.80。隧道内三层加密 + WebSocket 伪装，不是明文 CONNECT。
 # subscribe = 走 loom-share 控制面订阅（要填 subscribe_url，本机要有 mihomo）
 mode: ssh
-ssh_host: gary@110.40.153.38
+ssh_host: root@117.55.227.80
+identity_file: .us_vps_ed25519
 remote_port: 17900
 inner_port: 17900
 # tunnel_secret 由 start 自动写入，不要提交

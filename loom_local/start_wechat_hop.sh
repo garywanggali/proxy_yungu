@@ -2,7 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 SSHUTTLE="${SSHUTTLE:-/opt/homebrew/bin/sshuttle}"
-HOST="${1:-gary@110.40.153.38}"
+HOST="${1:-root@117.55.227.80}"
 USER_NAME="${SUDO_USER:-$USER}"
 cidrs=()
 while IFS= read -r line; do
@@ -12,7 +12,7 @@ while IFS= read -r line; do
 done < wechat_cidrs.txt
 
 PY="$(command -v python3 || true)"
-if [[ -n "$PY" ]]; then
+if [[ -n "$PY" && "${FORCE_HOP:-}" != 1 ]]; then
   if ! sudo -u "${USER_NAME}" -H "$PY" -c "import sys; sys.path.insert(0, '.'); from direct_or_hop import campus_needs_wechat_hop; raise SystemExit(0 if campus_needs_wechat_hop() else 1)"; then
     echo "微信这会儿校园网通，不开新转发（已有的先留着防抖）"
     exit 0
@@ -20,9 +20,10 @@ if [[ -n "$PY" ]]; then
 fi
 
 echo "用 ${USER_NAME} 的 SSH 走 ${HOST}，转发微信网段…"
-SSH_CMD="sudo -u ${USER_NAME} -H ssh -o BatchMode=yes -o ConnectTimeout=12 -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
+IDENT="$PWD/.us_vps_ed25519"
+SSH_CMD="sudo -u ${USER_NAME} -H ssh -i ${IDENT} -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=12 -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
 
-if ! sudo -u "${USER_NAME}" -H ssh -o BatchMode=yes -o ConnectTimeout=12 "${HOST}" "echo ok" >/dev/null; then
+if ! sudo -u "${USER_NAME}" -H ssh -i "${IDENT}" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=12 "${HOST}" "echo ok" >/dev/null; then
   echo "SSH 到 ${HOST} 失败" >&2
   exit 1
 fi
@@ -44,7 +45,7 @@ sleep 0.4
   --disable-ipv6 \
   --pidfile "$PWD/.sshuttle.pid" \
   -D \
-  --exclude 110.40.153.38 \
+  --exclude 117.55.227.80 \
   --exclude 10.0.0.0/8 \
   --exclude 116.62.109.80/32 \
   --ssh-cmd "${SSH_CMD}" \

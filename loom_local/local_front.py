@@ -19,8 +19,10 @@ from socketserver import ThreadingMixIn
 from cn_suffixes import (
     CN_SUFFIXES,
     DIRECT_SUFFIXES,
+    is_bili_live_or_cdn,
     is_bilibili_related,
     is_campus_cn,
+    is_lan_host,
     is_public_ip_literal,
     is_yungu_related,
 )
@@ -36,10 +38,47 @@ EXIT_HOST = "117.55.227.80"
 CAMPUS_TRY = 1.0
 STICKY = StickyCampus(fail_hold=45.0)
 # 图片站校园网 TLS 很快，主站经常 TCP 秒连、握手挂死。不能用一次成功代表整站。
-BILI_TLS_TIMEOUT = 1.2
-BILI_TLS_OK_HOLD = 30.0
+BILI_TLS_TIMEOUT = 0.7
+BILI_TLS_OK_HOLD = 45.0
 _BILI_LOCK = threading.Lock()
 _BILI_OK_IP: dict[str, tuple[str, float]] = {}
+_BILI_DNS_CACHE: dict[str, tuple[float, list[str]]] = {}
+_BILI_DNS_LOCK = threading.Lock()
+# Campus anycast that TCP-connects then hangs TLS — never worth probing.
+_BILI_BAD_PREFIXES = ("113.215.",)
+# Baidu DNS edges that finished TLS here when campus default DNS was dead.
+_BILI_BOOTSTRAP_IPS = {
+    "api.live.bilibili.com": (
+        "1.94.169.124",
+        "123.60.24.104",
+        "106.13.245.94",
+        "139.159.241.37",
+    ),
+    "live.bilibili.com": (
+        "8.134.32.222",
+        "139.159.252.156",
+        "47.101.221.220",
+        "139.159.241.37",
+    ),
+    "www.bilibili.com": (
+        "47.103.24.173",
+        "8.134.50.24",
+        "139.159.241.37",
+        "1.94.169.124",
+    ),
+    "api.bilibili.com": (
+        "1.94.169.124",
+        "106.13.245.94",
+        "139.159.241.37",
+        "123.60.24.104",
+    ),
+    # Campus DNS returns 113.215.245.* that hangs TLS; 114 gives a working edge.
+    "cdn-assets.yungu.org": (
+        "119.188.172.140",
+        "163.181.66.188",
+        "163.181.66.189",
+    ),
+}
 # 出口是洛杉矶。这些站校园网经常超时，直接走服务器。
 NEVER_HOP_SUFFIXES = ()
 
@@ -89,14 +128,14 @@ VPS_SUFFIXES = (
 def always_hop(host: str) -> bool:
     """国内站和 Cursor 固定走 VPS。哔哩哔哩先试校园网（通就快），不通再 hop。"""
     host = (host or "").lower()
-    if never_hop(host):
+    if never_hop(host) or is_lan_host(host):
         return False
     if is_yungu_related(host) or is_campus_cn(host):
         return False
     if any(host == s or host.endswith("." + s) for s in DIRECT_SUFFIXES):
         return False
-    # 校园网间歇性可看 B 站；强制洛杉矶会把 API/静态资源拖到数秒级。
-    if is_bilibili_related(host):
+    # B 站（含直播）先试校园网；默认 DNS 常给死 IP，bili_campus_ip 会换国内解析。
+    if is_bilibili_related(host) or is_bili_live_or_cdn(host):
         return False
     if is_public_ip_literal(host):
         return True
@@ -211,19 +250,94 @@ def connect_campus(host: str, port: int, timeout: float):
 
 
 def stay_on_campus(host: str) -> bool:
-    return never_hop(host) or is_yungu_related(host) or is_campus_cn(host)
+    host = (host or "").lower()
+    if never_hop(host) or is_lan_host(host) or is_campus_cn(host):
+        return True
+    if is_yungu_related(host):
+        # task/login 必须校园网；cdn-assets 的 113.215 任播 TLS 会挂死，允许洛杉矶兜底。
+        if host == "cdn-assets.yungu.org" or host.endswith(".cdn-assets.yungu.org"):
+            return False
+        return True
+    return False
+
+
+def needs_campus_tls_gate(host: str) -> bool:
+    """Hosts whose campus A record often TCP-connects then hangs TLS."""
+    return is_bilibili_related(host) or is_yungu_related(host)
+
+
+def _bili_ip_blocked(ip: str) -> bool:
+    return any(ip.startswith(p) for p in _BILI_BAD_PREFIXES)
 
 
 def _bili_candidates(host: str) -> list[str]:
+    """Merge A records from several mainland resolvers.
+
+    Campus / 114 / Ali often return 113.215.* anycast that TCP-connects but
+    TLS hangs. Baidu DNS usually returns edges whose handshake finishes, and
+    those China edges also hand out cn-gotcha play URLs instead of slow ov lines.
+    """
+    host = (host or "").lower()
+    now = time.time()
+    with _BILI_DNS_LOCK:
+        cached = _BILI_DNS_CACHE.get(host)
+        if cached and now < cached[0]:
+            return list(cached[1])
+
     ips: list[str] = []
-    for server in ("223.5.5.5", "114.114.114.114"):
+    # 114 often has the only working edge for cdn-assets.yungu.org.
+    servers = (
+        "180.76.76.76",
+        "114.114.114.114",
+        "10.0.5.31",
+        "119.29.29.29",
+        "223.5.5.5",
+    )
+    if host.endswith("yungu.org") or host.endswith("yungu-inc.org"):
+        servers = servers + ("1.1.1.1",)
+    for server in servers:
         try:
-            ips = dns_lookup_a(host, server)
+            found = dns_lookup_a(host, server)
         except OSError:
-            ips = []
-        if ips:
-            break
-    return ips[:3] or [host]
+            continue
+        for ip in found:
+            if ip not in ips and not _bili_ip_blocked(ip):
+                ips.append(ip)
+    for ip in _BILI_BOOTSTRAP_IPS.get(host, ()):
+        if ip not in ips and not _bili_ip_blocked(ip):
+            ips.append(ip)
+    if not ips:
+        # Last resort: system resolver, still drop known-bad anycast.
+        try:
+            for info in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM):
+                ip = info[4][0]
+                if ":" in ip or _bili_ip_blocked(ip) or ip in ips:
+                    continue
+                ips.append(ip)
+        except OSError:
+            pass
+    ips = ips[:8]
+    with _BILI_DNS_LOCK:
+        _BILI_DNS_CACHE[host] = (now + 30.0, list(ips))
+    return ips
+
+
+def _bili_tls_ok(ip: str, gate: str) -> bool:
+    sock = None
+    try:
+        sock = socket.create_connection((ip, 443), BILI_TLS_TIMEOUT)
+        sock.settimeout(BILI_TLS_TIMEOUT)
+        ctx = ssl.create_default_context()
+        tls = ctx.wrap_socket(sock, server_hostname=gate)
+        tls.close()
+        return True
+    except OSError:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        return False
 
 
 def bili_campus_ip(host: str, port: int) -> str | None:
@@ -232,67 +346,76 @@ def bili_campus_ip(host: str, port: int) -> str | None:
     if port != 443:
         gate = "www.bilibili.com"
     now = time.time()
-    cached = _BILI_OK_IP.get(gate)
-    if cached and now < cached[1] and not STICKY.skip_campus(gate):
-        return cached[0]
-    if STICKY.skip_campus(gate):
-        return None
     with _BILI_LOCK:
-        now = time.time()
         cached = _BILI_OK_IP.get(gate)
-        if cached and now < cached[1] and not STICKY.skip_campus(gate):
+        # Live APIs must stay on campus China edges. Ignoring sticky-fail:
+        # hopping them to LA only yields ov-gotcha lines at ~0.1MB/s.
+        if cached and now < cached[1]:
             return cached[0]
-        if STICKY.skip_campus(gate):
-            return None
-        ctx = ssl.create_default_context()
-        for ip in _bili_candidates(gate):
-            sock = None
-            try:
-                sock = socket.create_connection((ip, 443), BILI_TLS_TIMEOUT)
-                sock.settimeout(BILI_TLS_TIMEOUT)
-                tls = ctx.wrap_socket(sock, server_hostname=gate)
-                tls.close()
-                _BILI_OK_IP[gate] = (ip, time.time() + BILI_TLS_OK_HOLD)
-                STICKY.mark_ok(gate)
-                return ip
-            except OSError:
-                if sock is not None:
-                    try:
-                        sock.close()
-                    except OSError:
-                        pass
-        STICKY.mark_fail(gate)
-        _BILI_OK_IP.pop(gate, None)
+    # DNS + TLS stay outside the lock — browser opens many bili CONNECTs at once.
+    candidates = _bili_candidates(gate)
+    if not candidates:
         return None
+    winner: str | None = None
+    if len(candidates) == 1:
+        if _bili_tls_ok(candidates[0], gate):
+            winner = candidates[0]
+    else:
+        # Probe a few in parallel so one hanging anycast does not block play CDNs.
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        with ThreadPoolExecutor(max_workers=min(4, len(candidates))) as pool:
+            futs = {pool.submit(_bili_tls_ok, ip, gate): ip for ip in candidates[:6]}
+            try:
+                for fut in as_completed(futs, timeout=BILI_TLS_TIMEOUT + 0.4):
+                    ip = futs[fut]
+                    try:
+                        if fut.result():
+                            winner = ip
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                winner = None
+    if winner:
+        with _BILI_LOCK:
+            _BILI_OK_IP[gate] = (winner, time.time() + BILI_TLS_OK_HOLD)
+        STICKY.mark_ok(gate)
+        return winner
+    with _BILI_LOCK:
+        _BILI_OK_IP.pop(gate, None)
+    return None
 
 
 def try_campus(host: str, port: int):
     if host in ("127.0.0.1", "::1", "localhost", EXIT_HOST):
         return None
-    bili_ip = None
-    if is_bilibili_related(host):
+    gate_ip = None
+    if needs_campus_tls_gate(host):
         if port == 443:
-            bili_ip = bili_campus_ip(host, port)
-            if bili_ip is None:
+            gate_ip = bili_campus_ip(host, port)
+            if gate_ip is None:
                 return None
-        elif bili_campus_ip("www.bilibili.com", 443) is None:
+        elif is_bilibili_related(host) and bili_campus_ip("www.bilibili.com", 443) is None:
+            return None
+        elif is_yungu_related(host) and bili_campus_ip("task.yungu.org", 443) is None:
             return None
     campus_cn = is_campus_cn(host)
-    if not campus_cn and not is_bilibili_related(host) and STICKY.skip_campus(host):
+    lan = is_lan_host(host)
+    yungu = is_yungu_related(host)
+    if not campus_cn and not lan and not is_bilibili_related(host) and not yungu and STICKY.skip_campus(host):
         return None
     try:
-        if bili_ip:
-            sock = socket.create_connection((bili_ip, port), CAMPUS_TRY)
+        if gate_ip:
+            sock = socket.create_connection((gate_ip, port), CAMPUS_TRY)
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             return sock
         sock = connect_campus(host, port, CAMPUS_TRY)
         STICKY.mark_ok(host)
         return sock
     except OSError:
-        if not campus_cn and not is_bilibili_related(host):
+        if not campus_cn and not lan and not is_bilibili_related(host) and not yungu:
             STICKY.mark_fail(host)
-        if is_bilibili_related(host):
-            STICKY.mark_fail(host.lower() if port == 443 else "www.bilibili.com")
         return None
 
 
@@ -347,6 +470,9 @@ def pump(browser, inner, keys):
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    # Unbuffered. A buffered rfile read-ahead swallows Chrome's ClientHello when
+    # it is pipelined after CONNECT, and Google then answers with a broken TLS record.
+    rbufsize = 0
     timeout = 30
 
     def log_message(self, fmt, *args):
@@ -363,6 +489,10 @@ class Handler(BaseHTTPRequestHandler):
         return
 
     def do_CONNECT(self):
+        # CONNECT owns the socket until the tunnel closes. Leaving this false
+        # makes the handler parse the following TLS bytes as another HTTP
+        # request and write an error page into the handshake.
+        self.close_connection = True
         try:
             host, port_s = self.path.rsplit(":", 1)
             port = int(port_s)
@@ -370,7 +500,17 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(400)
             return
         dest = None if always_hop(host) else try_campus(host, port)
+        host_l = host.lower()
         if dest is None and stay_on_campus(host):
+            # api4/cdn.music share dead 123.58.180.* anycast — do not burn 4s again.
+            if host_l in (
+                "api4.music.163.com",
+                "cdn.music.163.com",
+                "vod.126.net",
+            ) or host_l.endswith(".vod.126.net"):
+                self.send_error(504, "campus netease edge unreachable")
+                self.log_via("campus-netease-miss", 504)
+                return
             try:
                 dest = connect_campus(host, port, 4.0)
                 STICKY.mark_ok(host)
@@ -386,6 +526,13 @@ class Handler(BaseHTTPRequestHandler):
                 splice(self.connection, dest)
             finally:
                 dest.close()
+            return
+        # cn play CDNs via LA are worse than failing fast — player can switch lines.
+        if host_l.endswith(".bilivideo.com") and (
+            host_l.startswith("cn-") or "--cn-gotcha" in host_l or ".cn-gotcha" in host_l
+        ):
+            self.send_error(504, "campus cn bilibili cdn unreachable")
+            self.log_via("campus-cdn-miss", 504)
             return
         target = ipv4_hop_target(host, port)
         if target is None:
@@ -406,8 +553,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_response(200, "Connection Established")
             self.end_headers()
+            self.wfile.flush()
             self.log_via(EXIT_HOST, 200)
-            pump(self.connection, inner, KEYS)
+            try:
+                pump(self.connection, inner, KEYS)
+            except (OSError, ValueError):
+                return
         except (OSError, ValueError) as exc:
             try:
                 self.send_error(502, str(exc))
@@ -456,8 +607,8 @@ class Handler(BaseHTTPRequestHandler):
             finally:
                 dest.close()
             return
-        if is_yungu_related(host) or is_campus_cn(host):
-            self.send_error(504, "campus yungu/bilibili unreachable")
+        if stay_on_campus(host):
+            self.send_error(504, "campus unreachable")
             return
         try:
             inner = open_inner()

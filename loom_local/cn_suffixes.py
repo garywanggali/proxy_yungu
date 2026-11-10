@@ -154,18 +154,28 @@ def is_yungu_related(host: str) -> bool:
     return "yungu" in host
 
 
-# 网易云、百度、Prometric、图寻固定走校园网。其它国内站仍可走洛杉矶。
+# 钉钉、网易云、百度、Prometric、图寻、视频号页面固定走校园网。其它国内站仍可走洛杉矶。
 CAMPUS_CN_SUFFIXES = (
+    "dingtalk.com",
+    "dingtalkapps.com",
+    "laiwang.com",
+    "res.wx.qq.com",
     "tuxun.fun",
     "daai.fun",
     "chao-fan.com",
     "dbankcdn.cn",
     "prometric.com.cn",
-    "music.163.com",
+    # 整个 163.com（含 music / 易盾 ac.dun）必须校园网出口；走洛杉矶会被风控。
+    "163.com",
     "iplay.163.com",
     "look.163.com",
     "music.126.net",
     "vod.126.net",
+    # Desktop HTTPDNS / telemetry. If these hop to LA, the app gets empty/wrong IPs.
+    "netease.com",
+    "126.net",
+    "126.com",
+    "127.net",
     "baidu.com",
     "baidu.jp",
     "bdstatic.com",
@@ -182,6 +192,37 @@ _BILI_MARKS = ("bili", "hdslb", "szbdyd", "b23.tv", "acgvideo", "acg.tv", "upos-
 def is_bilibili_related(host: str) -> bool:
     host = (host or "").lower().split("%")[0].rstrip(".")
     return any(mark in host for mark in _BILI_MARKS)
+
+
+def is_bili_live_or_cdn(host: str) -> bool:
+    """Live portal / play CDNs: campus TLS is dead or too slow; hop immediately."""
+    host = (host or "").lower().split("%")[0].rstrip(".")
+    if host.endswith("bilivideo.com") or host.endswith("bilivideo.cn"):
+        return True
+    if host.endswith("akamaized.net") and "upos-" in host:
+        return True
+    if "gotcha" in host:
+        return True
+    if host in (
+        "live.bilibili.com",
+        "api.live.bilibili.com",
+        "live-trace.bilibili.com",
+        "data.bilivideo.com",
+        "bvc.bilivideo.com",
+    ):
+        return True
+    if host.endswith(".live.bilibili.com") or host.endswith(".api.live.bilibili.com"):
+        return True
+    return False
+
+
+def is_lan_host(host: str) -> bool:
+    """Private, loopback, and link-local addresses stay on this network."""
+    try:
+        addr = ipaddress.ip_address((host or "").strip("[]"))
+    except ValueError:
+        return False
+    return addr.is_private or addr.is_loopback or addr.is_link_local
 
 
 def is_public_ip_literal(host: str) -> bool:

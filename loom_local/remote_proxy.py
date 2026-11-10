@@ -9,6 +9,7 @@ import select
 import socket
 import sys
 import threading
+import time
 
 from crypto3 import derive_keys
 from tunnel_proto import TYPE_CLOSE, TYPE_DATA, TYPE_ERR, TYPE_OK, TYPE_OPEN
@@ -21,6 +22,29 @@ def load_keys(path):
     return derive_keys(secret)
 
 
+def _coalesce(sock, data, limit=65536, wait=0.04):
+    """Bundle small CDN reads so each tunnel frame is not one round trip."""
+    if len(data) >= limit:
+        return data
+    parts = [data]
+    total = len(data)
+    deadline = time.time() + wait
+    while total < limit:
+        timeout = deadline - time.time()
+        if timeout <= 0:
+            break
+        ready, _, _ = select.select([sock], [], [], timeout)
+        if not ready:
+            break
+        more = sock.recv(limit - total)
+        if not more:
+            break
+        parts.append(more)
+        total += len(more)
+        deadline = time.time() + wait
+    return b"".join(parts)
+
+
 def splice_enc(inner, dest, keys):
     sockets = [inner, dest]
     try:
@@ -29,13 +53,14 @@ def splice_enc(inner, dest, keys):
             if not readable:
                 break
             if dest in readable:
-                data = dest.recv(16384)
+                data = dest.recv(65536)
                 if not data:
                     try:
                         send_frame(inner, keys, TYPE_CLOSE)
                     except OSError:
                         pass
                     return
+                data = _coalesce(dest, data)
                 send_frame(inner, keys, TYPE_DATA, data)
             if inner in readable:
                 typ, data = recv_frame(inner, keys)
@@ -45,6 +70,24 @@ def splice_enc(inner, dest, keys):
                     return
     except (OSError, ValueError):
         return
+
+
+def connect_ipv4(host, port, timeout=12):
+    host = host.strip("[]")
+    if ":" in host:
+        raise OSError("ipv6 skipped")
+    infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+    last = OSError("no ipv4")
+    for info in infos:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        try:
+            sock.connect(info[4])
+            return sock
+        except OSError as exc:
+            last = exc
+            sock.close()
+    raise last
 
 
 def handle(conn, keys):
@@ -58,7 +101,7 @@ def handle(conn, keys):
             return
         hostport = data.decode("ascii", "replace")
         host, port_s = hostport.rsplit(":", 1)
-        dest = socket.create_connection((host, int(port_s)), timeout=20)
+        dest = connect_ipv4(host, int(port_s), timeout=12)
         dest.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         send_frame(conn, keys, TYPE_OK)
         splice_enc(conn, dest, keys)
